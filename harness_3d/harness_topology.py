@@ -39,6 +39,9 @@ from OCP.gp import gp_Trsf, gp_Pnt
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
 
+# 导入接触检测优化
+from contact_optimization import sweep_and_prune, inflated_aabb, aabb_overlap
+
 S = XCAFDoc_ShapeTool
 WIRE_MIN_LEN = 20.0   # 可用线框最小总长 mm
 ASPECT_MIN = 4.0      # 管状判定最小长径比
@@ -674,136 +677,193 @@ def compute_relations(branch_data, conn_candidates, log):
                     best = r
         return best
 
+    n = len(branch_data)
+    # === 优化: 用 sweep-and-prune 找出管-管候选对 ===
+    # 为每个分支创建一个合并的包围盒
+    branch_boxes = []
+    for i in range(n):
+        if not bw[i]:
+            branch_boxes.append(None)
+            continue
+        # 合并该分支所有实体的包围盒
+        merged_box = Bnd_Box()
+        for item in bw[i]:
+            box = item["box"]
+            merged_box.Update(box.GetXMin(), box.GetYMin(), box.GetZMin(),
+                            box.GetXMax(), box.GetYMax(), box.GetZMax())
+        branch_boxes.append(merged_box)
+    
+    # 用 sweep-and-prune 找出候选对
+    valid_branches = [(i, branch_boxes[i]) for i in range(n) if branch_boxes[i] is not None]
+    if len(valid_branches) >= 2:
+        tube_candidates = sweep_and_prune(
+            [item[1] for item in valid_branches],
+            lambda x: x,
+            CONTACT_TOL
+        )
+        # 转换回原始索引
+        tube_candidates = [(valid_branches[i][0], valid_branches[j][0]) 
+                          for i, j in tube_candidates]
+    else:
+        tube_candidates = []
+    
+    log(f"[优化] sweep-and-prune: {len(tube_candidates)} 个管-管候选对 (原 {n*(n-1)//2} 对)")
+
     def spine_len(pts):
         return sum(_d3(pts[i], pts[i+1]) for i in range(len(pts)-1))
 
-    n = len(branch_data)
     branch_radius = []
     for b in branch_data:
         v = b.get("vol"); L = b.get("length")
         branch_radius.append(math.sqrt(v/(math.pi*L)) if v and L and L > 0 else 5.0)
     jtap_seen = set()
-    # 管-管
-    for i in range(n):
-        if not bw[i]:
+    # 管-管 (用 sweep-and-prune 候选对)
+    for i, j in tube_candidates:
+        if not bw[i] or not bw[j]:
             continue
         pi = branch_data[i]
         ptsi = [tuple(p) for p in pi["pts"]]
-        for j in range(i+1, n):
-            if not bw[j]:
-                continue
-            r = min_contact(bw[i], bw[j])
-            if not r or r[0] > CONTACT_TOL:
-                continue
-            dist = r[0]
-            pj = branch_data[j]
-            ptsj = [tuple(p) for p in pj["pts"]]
-            # 端面中心接触判定: 对互穿/嵌入式搭接鲁棒(支撑点法在嵌入时会失效)
-            hi = [(e, d) for e in (0, 1)
-                  for d in [_end_touch_other(ptsi[0] if e == 0 else ptsi[-1], bw[j])]
-                  if d is not None and d <= CONTACT_TOL]
-            hj = [(e, d) for e in (0, 1)
-                  for d in [_end_touch_other(ptsj[0] if e == 0 else ptsj[-1], bw[i])]
-                  if d is not None and d <= CONTACT_TOL]
-            if hi and hj:
-                ei = min(hi, key=lambda t: t[1])[0]
-                ej = min(hj, key=lambda t: t[1])[0]
-                rel["end_ends"].append((i, ei, j, ej))
-                log(f"接触: {pi['key']}端 <-> {pj['key']}端 ({dist:.1f}mm)")
-                # 接头若落在第三条管体中部 -> 双分支搭接点(degree=4 四路节点):
-                # 端-端连接保留, 同时在主干上记一处搭接站位
-                pe_i = ptsi[0] if ei == 0 else ptsi[-1]
-                pe_j = ptsj[0] if ej == 0 else ptsj[-1]
-                J = ((pe_i[0]+pe_j[0])/2, (pe_i[1]+pe_j[1])/2, (pe_i[2]+pe_j[2])/2)
-                for k in range(n):
-                    if k == i or k == j or not bw[k]:
-                        continue
-                    pk = branch_data[k]
-                    ptsk = [tuple(p) for p in pk["pts"]]
-                    s, q, dev = _poly_project(J, ptsk)
-                    Lk = spine_len(ptsk)
-                    if (dev <= branch_radius[i] + branch_radius[k] + CONTACT_TOL
-                            and STATION_END_TOL < s < Lk - STATION_END_TOL
-                            and (k, i, j) not in jtap_seen):
-                        jtap_seen.add((k, i, j))
-                        rel["taps"].append({"main": k, "s": s, "xyz": q, "tap": i,
-                                            "tap_end": ei, "dev": dev})
-                        log(f"接头搭接(四路节点): {pi['key']}+{pj['key']}接头 -> "
-                            f"{pk['key']} 站位{s:.1f}mm 偏差{dev:.1f}mm")
-                        break
-            elif hi:
-                ei = min(hi, key=lambda t: t[1])[0]
-                pe = ptsi[0] if ei == 0 else ptsi[-1]
-                s, q, dev = _poly_project(pe, ptsj)
-                Lj = spine_len(ptsj)
-                if s <= STATION_END_TOL or s >= Lj - STATION_END_TOL:
-                    rel["end_ends"].append((i, ei, j, 0 if s < Lj/2 else 1))
-                    log(f"接触(近端按端点连接): {pi['key']} <-> {pj['key']}端 ({dist:.1f}mm)")
-                else:
-                    rel["taps"].append({"main": j, "s": s, "xyz": q, "tap": i,
+        pj = branch_data[j]
+        ptsj = [tuple(p) for p in pj["pts"]]
+        r = min_contact(bw[i], bw[j])
+        if not r or r[0] > CONTACT_TOL:
+            continue
+        dist = r[0]
+        # 端面中心接触判定: 对互穿/嵌入式搭接鲁棒(支撑点法在嵌入时会失效)
+        hi = [(e, d) for e in (0, 1)
+              for d in [_end_touch_other(ptsi[0] if e == 0 else ptsi[-1], bw[j])]
+              if d is not None and d <= CONTACT_TOL]
+        hj = [(e, d) for e in (0, 1)
+              for d in [_end_touch_other(ptsj[0] if e == 0 else ptsj[-1], bw[i])]
+              if d is not None and d <= CONTACT_TOL]
+        if hi and hj:
+            ei = min(hi, key=lambda t: t[1])[0]
+            ej = min(hj, key=lambda t: t[1])[0]
+            rel["end_ends"].append((i, ei, j, ej))
+            log(f"接触: {pi['key']}端 <-> {pj['key']}端 ({dist:.1f}mm)")
+            # 接头若落在第三条管体中部 -> 双分支搭接点(degree=4 四路节点):
+            # 端-端连接保留, 同时在主干上记一处搭接站位
+            pe_i = ptsi[0] if ei == 0 else ptsi[-1]
+            pe_j = ptsj[0] if ej == 0 else ptsj[-1]
+            J = ((pe_i[0]+pe_j[0])/2, (pe_i[1]+pe_j[1])/2, (pe_i[2]+pe_j[2])/2)
+            for k in range(n):
+                if k == i or k == j or not bw[k]:
+                    continue
+                pk = branch_data[k]
+                ptsk = [tuple(p) for p in pk["pts"]]
+                s, q, dev = _poly_project(J, ptsk)
+                Lk = spine_len(ptsk)
+                if (dev <= branch_radius[i] + branch_radius[k] + CONTACT_TOL
+                        and STATION_END_TOL < s < Lk - STATION_END_TOL
+                        and (k, i, j) not in jtap_seen):
+                    jtap_seen.add((k, i, j))
+                    rel["taps"].append({"main": k, "s": s, "xyz": q, "tap": i,
                                         "tap_end": ei, "dev": dev})
-                    log(f"搭接: {pi['key']} -> {pj['key']} 站位{s:.1f}mm 偏差{dev:.1f}mm")
-            elif hj:
-                ej = min(hj, key=lambda t: t[1])[0]
-                pe = ptsj[0] if ej == 0 else ptsj[-1]
-                s, q, dev = _poly_project(pe, ptsi)
-                Li = spine_len(ptsi)
-                if s <= STATION_END_TOL or s >= Li - STATION_END_TOL:
-                    rel["end_ends"].append((j, ej, i, 0 if s < Li/2 else 1))
-                    log(f"接触(近端按端点连接): {pj['key']} <-> {pi['key']}端 ({dist:.1f}mm)")
-                else:
-                    rel["taps"].append({"main": i, "s": s, "xyz": q, "tap": j,
-                                        "tap_end": ej, "dev": dev})
-                    log(f"搭接: {pj['key']} -> {pi['key']} 站位{s:.1f}mm 偏差{dev:.1f}mm")
+                    log(f"接头搭接(四路节点): {pi['key']}+{pj['key']}接头 -> "
+                        f"{pk['key']} 站位{s:.1f}mm 偏差{dev:.1f}mm")
+                    break
+        elif hi:
+            ei = min(hi, key=lambda t: t[1])[0]
+            pe = ptsi[0] if ei == 0 else ptsi[-1]
+            s, q, dev = _poly_project(pe, ptsj)
+            Lj = spine_len(ptsj)
+            if s <= STATION_END_TOL or s >= Lj - STATION_END_TOL:
+                rel["end_ends"].append((i, ei, j, 0 if s < Lj/2 else 1))
+                log(f"接触(近端按端点连接): {pi['key']} <-> {pj['key']}端 ({dist:.1f}mm)")
             else:
-                rel["side_sides"].append({"a": pi["key"], "b": pj["key"], "dist": dist})
-                log(f"侧-侧接触(忽略, 手工处理): {pi['key']} <-> {pj['key']} ({dist:.1f}mm)")
+                rel["taps"].append({"main": j, "s": s, "xyz": q, "tap": i,
+                                    "tap_end": ei, "dev": dev})
+                log(f"搭接: {pi['key']} -> {pj['key']} 站位{s:.1f}mm 偏差{dev:.1f}mm")
+        elif hj:
+            ej = min(hj, key=lambda t: t[1])[0]
+            pe = ptsj[0] if ej == 0 else ptsj[-1]
+            s, q, dev = _poly_project(pe, ptsi)
+            Li = spine_len(ptsi)
+            if s <= STATION_END_TOL or s >= Li - STATION_END_TOL:
+                rel["end_ends"].append((j, ej, i, 0 if s < Li/2 else 1))
+                log(f"接触(近端按端点连接): {pj['key']} <-> {pi['key']}端 ({dist:.1f}mm)")
+            else:
+                rel["taps"].append({"main": i, "s": s, "xyz": q, "tap": j,
+                                    "tap_end": ej, "dev": dev})
+                log(f"搭接: {pj['key']} -> {pi['key']} 站位{s:.1f}mm 偏差{dev:.1f}mm")
+        else:
+            rel["side_sides"].append({"a": pi["key"], "b": pj["key"], "dist": dist})
+            log(f"侧-侧接触(忽略, 手工处理): {pi['key']} <-> {pj['key']} ({dist:.1f}mm)")
+    
+    # === 优化: 用 sweep-and-prune 找出管-非管候选对 ===
+    if cw:
+        all_items = []
+        for i in range(n):
+            if branch_boxes[i] is not None:
+                all_items.append(("branch", i, branch_boxes[i]))
+        for ci, c in enumerate(cw):
+            all_items.append(("conn", ci, c["box"]))
+        
+        if len(all_items) >= 2:
+            conn_candidates_pairs = sweep_and_prune(
+                [item[2] for item in all_items],
+                lambda x: x,
+                CONTACT_TOL
+            )
+            # 过滤出管-非管对
+            tube_conn_candidates = []
+            for i, j in conn_candidates_pairs:
+                if all_items[i][0] == "branch" and all_items[j][0] == "conn":
+                    tube_conn_candidates.append((all_items[i][1], all_items[j][1]))
+                elif all_items[i][0] == "conn" and all_items[j][0] == "branch":
+                    tube_conn_candidates.append((all_items[j][1], all_items[i][1]))
+        else:
+            tube_conn_candidates = []
+        log(f"[优化] sweep-and-prune: {len(tube_conn_candidates)} 个管-非管候选对 (原 {n*len(cw)} 对)")
+    else:
+        tube_conn_candidates = []
+    
     # 管-非管(连接器/扎带): 两遍扫描, 先端部后中部.
     # 同一刚体在端部已命名后, 其在附近管段上的附带接触不再另起站位
     # (避免同一连接器/扎带被编出两个 CON/TIE 码, 破坏编码对照表 1:1).
     term_xyz = []  # (tag, 端部xyz, 包围盒对角线)
-    for i in range(n):
+    for i, ci in tube_conn_candidates:
         if not bw[i]:
             continue
+        c = cw[ci]
         pi = branch_data[i]
         ptsi = [tuple(p) for p in pi["pts"]]
         Li = spine_len(ptsi)
-        for c in cw:
-            r = min_contact(bw[i], [c])
-            if not r or r[0] > CONTACT_TOL:
-                continue
-            dist, pa, _pc = r
-            s, q, dev = _poly_project(pa, ptsi)
-            if s <= END_TOL or s >= Li - END_TOL:
-                end = 0 if s < Li/2 else 1
-                exyz = ptsi[0] if end == 0 else ptsi[-1]
-                rel["terminals"].append({"branch": i, "end": end, "tag": c["tag"],
-                                        "kind": c["kind"], "dist": dist})
-                term_xyz.append((c["tag"], exyz, 2.0*c["r"]))
-                log(f"端部接触: {pi['key']}[{end}] <-> 实体 {c['tag']} ({dist:.1f}mm)")
-    for i in range(n):
+        r = min_contact(bw[i], [c])
+        if not r or r[0] > CONTACT_TOL:
+            continue
+        dist, pa, _pc = r
+        s, q, dev = _poly_project(pa, ptsi)
+        if s <= END_TOL or s >= Li - END_TOL:
+            end = 0 if s < Li/2 else 1
+            exyz = ptsi[0] if end == 0 else ptsi[-1]
+            rel["terminals"].append({"branch": i, "end": end, "tag": c["tag"],
+                                    "kind": c["kind"], "dist": dist})
+            term_xyz.append((c["tag"], exyz, 2.0*c["r"]))
+            log(f"端部接触: {pi['key']}[{end}] <-> 实体 {c['tag']} ({dist:.1f}mm)")
+    for i, ci in tube_conn_candidates:
         if not bw[i]:
             continue
+        c = cw[ci]
         pi = branch_data[i]
         ptsi = [tuple(p) for p in pi["pts"]]
         Li = spine_len(ptsi)
-        for c in cw:
-            r = min_contact(bw[i], [c])
-            if not r or r[0] > CONTACT_TOL:
-                continue
-            dist, pa, _pc = r
-            s, q, dev = _poly_project(pa, ptsi)
-            if s <= END_TOL or s >= Li - END_TOL:
-                continue  # 第一遍已处理
-            dup = next((t for t in term_xyz if t[0] == c["tag"]
-                        and _d3(q, t[1]) <= t[2]), None)
-            if dup is not None:
-                log(f"同体接触(跳过): {pi['key']} 站位{s:.1f}mm <-> 实体 {c['tag']} "
-                    f"(距已命名端部{_d3(q, dup[1]):.1f}mm, 同一刚体)")
-                continue
-            rel["tie_stations"].append({"branch": i, "s": s, "xyz": q,
-                                       "tag": c["tag"], "kind": c["kind"], "dev": dev})
-            log(f"中部固定: {pi['key']} 站位{s:.1f}mm <-> 实体 {c['tag']} ({dist:.1f}mm)")
+        r = min_contact(bw[i], [c])
+        if not r or r[0] > CONTACT_TOL:
+            continue
+        dist, pa, _pc = r
+        s, q, dev = _poly_project(pa, ptsi)
+        if s <= END_TOL or s >= Li - END_TOL:
+            continue  # 第一遍已处理
+        dup = next((t for t in term_xyz if t[0] == c["tag"]
+                    and _d3(q, t[1]) <= t[2]), None)
+        if dup is not None:
+            log(f"同体接触(跳过): {pi['key']} 站位{s:.1f}mm <-> 实体 {c['tag']} "
+                f"(距已命名端部{_d3(q, dup[1]):.1f}mm, 同一刚体)")
+            continue
+        rel["tie_stations"].append({"branch": i, "s": s, "xyz": q,
+                                   "tag": c["tag"], "kind": c["kind"], "dev": dev})
+        log(f"中部固定: {pi['key']} 站位{s:.1f}mm <-> 实体 {c['tag']} ({dist:.1f}mm)")
     return rel
 
 
