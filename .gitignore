@@ -1,0 +1,27 @@
+# 数据文件
+*.json
+*.xlsx
+*.xls
+*.csv
+
+# 输出文件
+*.html
+*.txt
+
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 环境
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
