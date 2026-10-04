@@ -1,97 +1,64 @@
-# Harness 3D Topology Analyzer (MUSE working version)
+# 线束 3D 拓扑解析工具（本地运行说明）
 
-One-click: CATIA-exported STEP → 6-sheet wiring-harness FROMTO Excel report.
+从 CATIA 导出的 STEP(AP242) 中提取线束拓扑：分支中心线 → 拓扑节点 → 关联连接器。
+只读 STEP 里的 3D 几何（装配树 + 实体 + 曲线），**不需要 CATIA、不需要线束模块授权**。
 
-Validated end-to-end on X1X-DRD (22 solids: 14 curves, 7 connectors, 21/21 paths OK,
-zero `#S` residue, all length-conservation checks pass).
-IP-Harness (189 solids) name mapping validated; full run pending.
+## 核心能力
 
-## Files
+- **分支判定不依赖命名**：纯结构化判定——实体有成组等面积平面端盖、长径比≥4、侧壁面很少
+  → 判为管状分支；连接器（粗短）、卡扣（碎面）被自动排除。
+- **中心线自动获取**：分支有 Flexible Curve 线框就用线框；**没有线框时自动从管状实体反推**
+  （侧壁面逐站位轮廓圆拟合求轴线 → 半壳去重 → 拼接 → 端点对齐端盖中心）。
+  反推精度已用 M1E-DRD 验证：与真实中心线对比，平均偏差 0.10mm、最大 0.34mm。
 
-| File | Role |
+## 一、环境准备（只需做一次）
+
+1. 安装 Anaconda（已有可跳过）。
+2. 新建独立环境（不要装进旧的 Python 3.8 里）：
+```bash
+conda create -n harness python=3.12 -y
+conda activate harness
+pip install "cadquery-ocp==8.0.1.0.0" numpy matplotlib openpyxl
+```
+`cadquery-ocp` 是 OpenCASCADE 几何内核的 Python 绑定（约两三百 MB），STEP 的装配树读取和几何计算全靠它。
+
+## 二、使用方法（图形界面，推荐）
+
+1. 把本工具包解压到任意文件夹（比如 `D:\harness_tool\`）。
+2. 双击 `启动线束拓扑解析.bat`（它会自动找到 harness 环境并打开界面）。
+3. 点"选择 STEP 文件并分析"，选中你的 `.stp` / `.step` 文件。
+4. 等待分析完成，输出文件自动生成在 **STEP 文件所在文件夹**：
+   - `<模型名>_线束3D拓扑分析.xlsx` —— 分支清单 / 拓扑节点 / 连续走线 / 连接器卡扣清单 / 说明
+   - `<模型名>_拓扑3D图.png` —— 3D 拓扑图（分支=彩色线，分支点=红菱形，终端=黑点，灰盒=连接器/卡扣）
+   - `<模型名>_topology.json` —— 中间数据（可删）
+
+界面上的"端点聚类容差"默认 3.0mm：分支端点在此距离内会被聚成同一个拓扑节点。
+
+## 三、命令行方式（可选）
+
+```bash
+conda activate harness
+cd D:\harness_tool
+python harness_topology.py 你的模型.stp 3.0
+python viz_topology.py
+python report_xlsx.py
+```
+
+## 四、适用条件与局限
+
+- STEP 需为 AP242（AP214 也可），保留装配结构；
+- 分支产品最好带有 Flexible Curve 中心线（如 CATIA Electrical Harness 导出的 Multi-branchable）；
+  若只有扫掠实体、没有中心线，本工具会提示无法识别分支，需要另做中心线反推；
+- 连接器关联基于空间邻近启发式，结果需对照 3D 图复核；
+- STEP 为哑几何，不含导线代号/回路等电气属性；电气拓扑需用 CATIA EHA 导出的 from-to/XML 另行对齐。
+
+## 五、文件清单
+
+| 文件 | 说明 |
 |---|---|
-| `harness_3d/fromto_report.py` | Main entry: STEP → 6-sheet XLSX (`Meta/Connectors/Curves/FromToPaths/FromToLatest/Diagnostics`) |
-| `harness_3d/harness_topology.py` | Contact-based topology extraction (tubes, connectors, clamps, stations, segments, nodes, runs) |
-| `harness_3d/map_step_names.py` | STEP text → real instance names (`S{i}` mapping, standalone usable) |
-| `harness_3d/tests/test_fromto.py` | 23 FROMTO report tests |
-| `harness_3d/tests/test_topology_logic.py` | 50 topology logic tests |
-| `harness_3d/requirements.txt` | Python 3.8 compatible deps |
-| `harness_3d/requirements-py312.txt` | Python 3.12 deps |
-
-## Usage
-
-```bash
-pip install -r harness_3d/requirements.txt   # or requirements-py312.txt
-python harness_3d/fromto_report.py <input.stp> -o <output.xlsx>
-# optional: --original <old_fromto.xlsx>  (adds OrigLength comparison column)
-```
-
-Tests:
-
-```bash
-python harness_3d/tests/test_topology_logic.py
-python harness_3d/tests/test_fromto.py
-```
-
-## Key design decisions (validated, do not "simplify" away)
-
-### 1. Name mapping — `S{i}` = representation item order, NOT definition order
-
-- OCCT transfer order follows the `ADVANCED_BREP_SHAPE_REPRESENTATION` item list,
-  **not** the order `MANIFOLD_SOLID_BREP` entities appear in the STEP text.
-- Both `MANIFOLD_SOLID_BREP` **and** `BREP_WITH_VOIDS` must be parsed
-  (IP-Harness has 3 `BREP_WITH_VOIDS`; missing them caused a 186/189 mismatch).
-- `\X2\...\X0\` escape sequences are decoded to real CJK characters in-code.
-- The tool self-checks: parsed name count must equal OCP solid count, otherwise it
-  aborts **before** the hours-long topology pass.
-- Do NOT match names via OCP `TransientProcess.Find(entity)` on sub-entities
-  (returns empty) or via `model.Value(n)` numbering (≠ STEP `#id`).
-  Do NOT match via vertex-coordinate lookup — it silently fails on `BREP_WITH_VOIDS`.
-
-### 2. Positioning rule — derive from the TUBE, never from the device itself
-
-A clamp/connector's reported coordinate is **not** its volume center, bbox center,
-or any feature point on its own geometry. It is derived from the tube it contacts:
-
-- Device touches a tube **end** (within 5 mm of the end) → coordinate = that
-  tube segment's **end-face center**.
-- Clamp touches a tube **middle** → coordinate = the **nearest** tube segment's
-  end-face center (topology internally splits at the spine projection point;
-  the report caliber is uniformly end-face centers).
-
-The device's own solid is used only for contact detection ("does it touch?"),
-never for positioning. Volume-center-based approaches are wrong in principle.
-
-### 3. Thresholds (mm, validated against CATIA VBA ground truth)
-
-| Constant | Value | Meaning |
-|---|---|---|
-| `CONTACT_TOL` | 2.0 | solid contact decision distance |
-| `END_TOL` | 5.0 | support point within this of tube end ⇒ end contact |
-| `STATION_END_TOL` | 5.0 | tap projection within this of main-tube end ⇒ treated as end joint |
-| station merge | 10.0 | arc-length + spatial dual condition |
-
-### 4. Contact performance — 3-layer filter, `BRepExtrema` only at the last layer
-
-`min_contact()` in `harness_topology.py`:
-
-1. Bounding-sphere prefilter (cheap but loose — nearly useless for long tubes).
-2. **Exact** bounding-box distance via `Bnd_Box.Distance` (tight and provably safe:
-   box distance > `CONTACT_TOL` ⇒ true distance > `CONTACT_TOL`, so skipping
-   cannot change the result).
-3. `BRepExtrema_DistShapeShape` only for pairs passing (1) and (2).
-
-Layer 2 was verified to produce **byte-identical** report output on X1X
-(all 5 data sheets, cell-by-cell) while eliminating the bulk of exact distance calls.
-
-### 5. Report format — 6 sheets, fixed
-
-`Meta / Connectors / Curves / FromToPaths / FromToLatest / Diagnostics`.
-`FromToPaths.Status` ∈ {`OK`, `NOT_CONNECTED`}; broken pairs carry empty
-Length/PathMarker with gap details in `Diagnostics.BrokenDetails`.
-`PathMarker` = JSON `[connector, curve, (clamp, curve)*, connector]`.
-Path length = sum of curve lengths (conservation checked per row).
-
-### 6. Stable coding
-
-`SEG / CON / TIE / BN / N`. Clamp code is `TIE` (not `CLP`).
+| `启动线束拓扑解析.bat` | 双击启动图形界面 |
+| `harness_gui.pyw` | 图形界面主程序 |
+| `harness_topology.py` | 拓扑分析核心（可独立命令行运行） |
+| `viz_topology.py` | 3D 图生成 |
+| `report_xlsx.py` | Excel 报告生成 |
+| `README.md` | 本说明 |
